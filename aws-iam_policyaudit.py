@@ -4,7 +4,7 @@ AWS IAM Permissiveness Audit — refactor of aws-iam-allactions.py (sensitive-aw
 
 What’s new in this splice
 -------------------------
-- Loads a curated **sensitive actions set** from JSON (or uses a solid default).
+- Loads a curated **sensitive actions set** from JSON
 - Treats findings as **sensitive** if they include "*" / "service:*" OR intersect the sensitive set.
 - **Severity bump**: internal findings that are wildcard or sensitive are raised to at least **High-ish**.
 - Keeps normalized 0–100 scores and your original structure.
