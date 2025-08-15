@@ -51,6 +51,14 @@ Scan all customer-managed policies in the default AWS CLI profile, simulate sens
 python aws-iam-permissiveness-audit.py --simulate --check-privesc --format json --output findings.json
 ```
 
+## Severity Score Legend
+
+* **80–100: Critical** — Wildcard permissions with public or external exposure, or confirmed privilege escalation.
+* **50–79: High** — Broad permissions with many sensitive actions and high exposure, but not fully public.
+* **20–49: Medium** — Wildcard or broad permissions internal-only, or mitigated by strong conditions.
+* **1–19: Low** — Narrow permissions or restrictive conditions.
+* **0: Informational** — No confirmed access or insufficient permissions to evaluate.
+
 ## Output
 
 Findings include:
