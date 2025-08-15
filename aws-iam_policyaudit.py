@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """
-AWS IAM Permissiveness Audit — refactor of aws-iam-allactions.py
+AWS IAM Permissiveness Audit — refactor of aws-iam-allactions.py (fully patched)
 
-Goals
------
-- Keep the original wildcard/many-actions checks.
-- Add attachment awareness (which users/roles/groups are affected).
-- Optional effective-access simulation per principal (curated sensitive actions).
-- Optional privilege-escalation pattern detection.
-- Optional cross-account trust & exposure checks for roles.
-- Track and print findings for any **insufficient permissions** encountered (e.g., AccessDenied).
-- Scoring model (impact × likelihood × exposure) and multi-format output.
+Highlights
+----------
+- Wildcard & many-actions detection on policy documents
+- Attachment awareness (users/roles/groups using a managed policy)
+- Sensitive action simulation per principal (optional)
+- Privilege-escalation pattern detection (optional)
+- Cross-account/public role trust exposure classification (optional)
+- Tracks and prints **insufficient-permissions** findings for denied API calls
+- Robust handling where `list_entities_for_policy` does NOT return ARNs
+- On-demand ARN resolution for principals (User/Role/Group)
+- Severity scoring and multi-format output (table, JSON, CSV)
 
 Usage (examples)
 ----------------
@@ -117,7 +119,7 @@ def score_finding(impact: float, likelihood: float, exposure: float) -> float:
 class Attachment:
     type: str  # User | Role | Group
     name: str
-    arn: str
+    arn: Optional[str]  # may be None; resolved later when needed
 
 
 @dataclass
@@ -159,6 +161,46 @@ def assume_role_if_needed(session, role_arn: Optional[str]):
         region_name=session.region_name,
     )
 
+# ------------------------- partition & ARN resolution -------------------------
+def get_partition_from_sts_arn(sts_arn: str) -> str:
+    # e.g., arn:aws:sts::123456789012:assumed-role/...
+    try:
+        return sts_arn.split(":")[1]  # "aws", "aws-us-gov", "aws-cn"
+    except Exception:
+        return "aws"
+
+
+def resolve_principal_arn(iam, principal: Attachment, account_id: str, partition: str) -> Optional[str]:
+    """
+    Resolve a principal's ARN (User/Role/Group).
+    Try GetUser/GetRole/GetGroup first. If denied, construct best-effort ARN.
+    """
+    try:
+        if principal.type == "Role":
+            role = iam.get_role(RoleName=principal.name)["Role"]
+            return role.get("Arn")
+        if principal.type == "User":
+            user = iam.get_user(UserName=principal.name)["User"]
+            return user.get("Arn")
+        if principal.type == "Group":
+            grp = iam.get_group(GroupName=principal.name)["Group"]
+            # In most regions, GetGroup returns Arn in the "Group" dict
+            arn = grp.get("Arn")
+            if arn:
+                return arn
+    except ClientError:
+        # Fall through to best-effort construction
+        pass
+
+    # Construct a best-effort ARN (works for roles/users/groups typical formats)
+    if principal.type == "Role":
+        return f"arn:{partition}:iam::{account_id}:role/{principal.name}"
+    if principal.type == "User":
+        return f"arn:{partition}:iam::{account_id}:user/{principal.name}"
+    if principal.type == "Group":
+        return f"arn:{partition}:iam::{account_id}:group/{principal.name}"
+    return None
+
 # ------------------------- IAM enumeration -------------------------
 def list_policies(iam, include_aws_managed: bool) -> Iterable[Dict[str, Any]]:
     scopes = ["Local"] + (["AWS"] if include_aws_managed else [])
@@ -170,15 +212,20 @@ def list_policies(iam, include_aws_managed: bool) -> Iterable[Dict[str, Any]]:
 
 
 def list_entities_for_policy(iam, policy_arn: str) -> Dict[str, List[Attachment]]:
+    """
+    Returns entity attachments for a managed policy.
+    NOTE: list_entities_for_policy does not include ARNs for entities, so we only
+    return names here and resolve ARNs later when needed.
+    """
     out: Dict[str, List[Attachment]] = {"User": [], "Role": [], "Group": []}
     paginator = iam.get_paginator("list_entities_for_policy")
     for page in paginator.paginate(PolicyArn=policy_arn):
         for u in page.get("PolicyUsers", []):
-            out["User"].append(Attachment("User", u["UserName"], u["UserArn"]))
+            out["User"].append(Attachment("User", u["UserName"], arn=None))
         for r in page.get("PolicyRoles", []):
-            out["Role"].append(Attachment("Role", r["RoleName"], r["RoleArn"]))
+            out["Role"].append(Attachment("Role", r["RoleName"], arn=None))
         for g in page.get("PolicyGroups", []):
-            out["Group"].append(Attachment("Group", g["GroupName"], g["GroupArn"]))
+            out["Group"].append(Attachment("Group", g["GroupName"], arn=None))
     return out
 
 
@@ -259,7 +306,7 @@ def analyze_cross_account_exposure(trust_doc: Dict[str, Any], self_acct: str) ->
         return "public"
     acct_ids: Set[str] = set()
     for p in principals:
-        if p.startswith("arn:aws:iam::"):
+        if p.startswith("arn:aws:iam::") or p.startswith("arn:aws-us-gov:iam::") or p.startswith("arn:aws-cn:iam::"):
             try:
                 acct_ids.add(p.split("::")[1].split(":")[0])
             except Exception:
@@ -308,8 +355,12 @@ def run_audit(
     cfg = BotoConfig(retries={"max_attempts": 10, "mode": "standard"})
     iam = session.client("iam", config=cfg)
 
-    # Resolve account id
-    account_id = session.client("sts").get_caller_identity().get("Account")
+    # Resolve account id and partition
+    sts = session.client("sts")
+    ident = sts.get_caller_identity()
+    account_id = ident.get("Account")
+    caller_arn = ident.get("Arn")
+    partition = get_partition_from_sts_arn(caller_arn)
 
     sensitive_actions = [a for a in SENSITIVE_ACTIONS_SEED if a.split(":")[0] in services or a == "*"]
 
@@ -349,8 +400,12 @@ def run_audit(
             res.append(make_insufficient_perm_finding(account_id, policy_arn, policy_name, "iam:ListEntitiesForPolicy", e))
             attached = {"User": [], "Role": [], "Group": []}
 
-        # Turn policy-centric hits into principal-centric findings
-        def mk_find(principal: Optional[Attachment], risk_type: str, detail: str, action_count: Optional[int], conditions: Optional[Dict[str, Any]], exposure: str, explicit_denies: int) -> Finding:
+        # Helper to build a finding; resolve ARN if missing
+        def mk_find(principal: Optional[Attachment], risk_type: str, detail: str, action_count: Optional[int],
+                    conditions: Optional[Dict[str, Any]], exposure: str, explicit_denies: int) -> Finding:
+            principal_arn = None
+            if principal:
+                principal_arn = principal.arn or resolve_principal_arn(iam, principal, account_id, partition)
             return Finding(
                 account_id=account_id,
                 policy_arn=policy_arn,
@@ -358,7 +413,7 @@ def run_audit(
                 attachment_type="managed",
                 principal_type=(principal.type if principal else None),
                 principal_name=(principal.name if principal else None),
-                principal_arn=(principal.arn if principal else None),
+                principal_arn=principal_arn,
                 risk_type=risk_type,
                 detail=detail,
                 action_count=action_count,
@@ -425,10 +480,32 @@ def run_audit(
         if simulate or check_privesc_flag:
             principals = attached["User"] + attached["Role"] + attached["Group"]
             for principal in principals:
+                # Ensure we have an ARN for SimulatePrincipalPolicy
+                arn = (principal.arn if principal else None) or (resolve_principal_arn(iam, principal, account_id, partition) if principal else None)
+                if principal and not arn:
+                    # Couldn’t resolve; record and continue
+                    res.append(Finding(
+                        account_id=account_id,
+                        policy_arn=policy_arn,
+                        policy_name=policy_name,
+                        attachment_type="managed",
+                        principal_type=principal.type,
+                        principal_name=principal.name,
+                        principal_arn=None,
+                        risk_type="insufficient-permissions",
+                        detail=f"Could not resolve ARN for {principal.type}:{principal.name} to run SimulatePrincipalPolicy",
+                        severity_score=0.0,
+                    ))
+                    continue
+
+                if not principal:
+                    # No principal (unattached policy) → nothing to simulate
+                    continue
+
                 try:
-                    allowed = simulate_principal_actions(iam, principal.arn, sensitive_actions)
+                    allowed = simulate_principal_actions(iam, arn, sensitive_actions)  # type: ignore[arg-type]
                 except ClientError as e:
-                    errors.append(f"SimulatePrincipalPolicy failed for {principal.arn}: {e}")
+                    errors.append(f"SimulatePrincipalPolicy failed for {arn}: {e}")
                     res.append(make_insufficient_perm_finding(account_id, policy_arn, policy_name, "iam:SimulatePrincipalPolicy", e))
                     allowed = []
                 if allowed:
@@ -461,18 +538,6 @@ def run_audit(
     with futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
         for chunk_findings in ex.map(process_policy, policy_iter, chunksize=5):
             findings.extend(chunk_findings)
-
-    # (Optional) Surface unexpected errors as findings (commented out by default)
-    # for err in errors:
-    #     findings.append(Finding(
-    #         account_id=account_id,
-    #         policy_arn="",
-    #         policy_name="",
-    #         attachment_type="n/a",
-    #         risk_type="internal-error",
-    #         detail=err,
-    #         severity_score=0.0,
-    #     ))
 
     return findings
 
