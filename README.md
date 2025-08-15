@@ -75,14 +75,17 @@ Permission errors are shown as `permission-error` findings with the failed opera
 
 ## Example Output
 
-+----------+-------------+--------------------+----------------------+-------------+------------------+---------+----------+--------------------------------------------------+
-| severity | risk_type   | principal          | policy               | attachment  | exposure         | actions | privesc  | detail                                           |
-+----------+-------------+--------------------+----------------------+-------------+------------------+---------+----------+--------------------------------------------------+
-| 91.0     | wildcard    | Role:AdminRole     | AdminAccess          | managed     | public           | 999     |          | Effect:Allow with Action:* and Resource:*       |
-| 75.0     | many-actions| User:JohnDoe       | CustomPowerUser      | managed     | external-account | 240     |          | Effect:Allow with many distinct actions         |
-| 28.5     | wildcard    | Role:DevOpsRole    | DevOpsWildcardPolicy | managed     | internal         | 999     |          | Effect:Allow with Action:* and Resource:*       |
-| 0.0      | insufficient-permissions | -:-               | SecretPolicy         | managed     | internal         | 0       |          | iam:GetPolicy failed: AccessDenied: Not allowed |
-+----------+-------------+--------------------+----------------------+-------------+------------------+---------+----------+--------------------------------------------------+
+### Example findings (GitHub Markdown)
+
+Findings summary: wildcard=2, many-actions=1, insufficient-permissions=1
+
+| severity | risk_type                | principal       | policy               | attachment | exposure         | actions | privesc | detail                                         |
+|----------|--------------------------|-----------------|----------------------|------------|------------------|---------|---------|------------------------------------------------|
+| 91.0     | wildcard                 | Role:AdminRole  | AdminAccess          | managed    | public           | 999     |         | Effect:Allow with Action:* and Resource:*     |
+| 75.0     | many-actions             | User:JohnDoe    | CustomPowerUser      | managed    | external-account | 240     |         | Effect:Allow with many distinct actions       |
+| 68.0     | privesc                  | Role:DevOpsRole   | EscalationPolicy     | managed    | external-account | 15      | PassRole, CreatePolicyVersion             | Policy allows IAM role creation and policy edits |
+| 28.5     | wildcard                 | Role:DevOpsRole | DevOpsWildcardPolicy | managed    | internal         | 999     |         | Effect:Allow with Action:* and Resource:*     |
+| 0.0      | insufficient-permissions | -:-             | SecretPolicy         | managed    | internal         | 0       |         | iam:GetPolicy failed: AccessDenied: Not allowed |
 
 ## Requirements
 
