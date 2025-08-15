@@ -59,11 +59,52 @@ SENSITIVE_ACTIONS_SEED = sorted({
 })
 
 PRIVESC_RULES = [
-    {"name": "PassRole+Compute", "actions": ["iam:PassRole", "lambda:CreateFunction", "ecs:RunTask", "ec2:RunInstances"]},
-    {"name": "PolicyAttachment", "actions": ["iam:AttachUserPolicy", "iam:AttachRolePolicy", "iam:PutUserPolicy", "iam:PutRolePolicy"]},
-    {"name": "TrustPolicyEdit", "actions": ["iam:UpdateAssumeRolePolicy"]},
-    {"name": "CredsCreation", "actions": ["iam:CreateAccessKey", "iam:CreateLoginProfile"]},
+    # Policy versioning
+    ["iam:CreatePolicyVersion", "iam:SetDefaultPolicyVersion"],
+    # Attach or put admin policy
+    ["iam:AttachUserPolicy"], 
+    ["iam:AttachRolePolicy"],
+    ["iam:PutUserPolicy"],
+    ["iam:PutRolePolicy"],
+    # Update trust and assume
+    ["iam:UpdateAssumeRolePolicy", "sts:AssumeRole"],
+    # PassRole + compute service
+    ["iam:PassRole", "lambda:CreateFunction"],
+    ["iam:PassRole", "lambda:UpdateFunctionCode"],
+    ["iam:PassRole", "lambda:UpdateFunctionConfiguration"],
+    ["iam:PassRole", "ecs:RunTask"],
+    ["iam:PassRole", "ec2:RunInstances", "ec2:AssociateIamInstanceProfile"],
+    ["iam:PassRole", "ec2:ReplaceIamInstanceProfileAssociation"],
+    ["iam:PassRole", "glue:CreateDevEndpoint"],
+    ["iam:PassRole", "sagemaker:CreateNotebookInstance"],
+    ["iam:PassRole", "codebuild:StartBuild"],
+    # Create credentials for higher-priv identity
+    ["iam:CreateAccessKey"],
+    ["iam:CreateLoginProfile"],
+    # Remove or detach boundaries / deny policies
+    ["iam:DeleteUserPermissionsBoundary"],
+    ["iam:DeleteRolePermissionsBoundary"],
+    ["iam:DetachUserPolicy"],
+    ["iam:DetachRolePolicy"],
+    ["iam:DeleteUserPolicy"],
+    ["iam:DeleteRolePolicy"],
+    # Key Management Service privilege escalations
+    ["kms:CreateGrant", "kms:RetireGrant"],
+    ["kms:ScheduleKeyDeletion"],
+    ["kms:DisableKey"],
+    ["kms:EnableKey"],
+    # Secrets Manager privilege escalations
+    ["secretsmanager:PutSecretValue"],
+    ["secretsmanager:UpdateSecret"],
+    ["secretsmanager:DeleteSecret"],
+    # S3 bucket policy/ACL modifications that could allow uploading malicious code
+    ["s3:PutBucketPolicy"],
+    ["s3:PutBucketAcl"],
+    ["s3:PutBucketPublicAccessBlock"],
+    # CloudFormation create stack with admin role
+    ["cloudformation:CreateStack", "iam:PassRole"],
 ]
+
 
 # ------------------------- helper utilities -------------------------
 def ensure_list(x: Any) -> List[Any]:
