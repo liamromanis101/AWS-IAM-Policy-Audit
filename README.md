@@ -30,6 +30,7 @@ python aws-iam-permissiveness-audit.py [options]
 
 | Option                      | Description                                                   |
 | --------------------------- | ------------------------------------------------------------- |
+| `--h`                       | Prints help message                                           |
 | `--threshold N`             | Action count threshold for many-actions (default: 20)         |
 | `--include-aws-managed`     | Include AWS-managed policies in the scan                      |
 | `--simulate`                | Simulate sensitive actions per principal                      |
