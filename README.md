@@ -43,7 +43,7 @@ python aws-iam-permissiveness-audit.py [options]
 | `--region REGION`           | AWS region (for STS and service calls)                        |
 | `--assume-role-arn ARN`     | Role ARN to assume before scanning                            |
 | `--max-workers N`           | Concurrency for policy processing (default: 8)                |
-|  --sensitive-actions-file FILE` | Path to JSON file (array of actions) to treat as sensitive |
+|  `--sensitive-actions-file FILE` | Path to JSON file (array of actions) to treat as sensitive |
 
 ## Example
 
