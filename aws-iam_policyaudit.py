@@ -111,8 +111,9 @@ def score_finding(impact: float, likelihood: float, exposure: float) -> float:
     impact = max(0.0, min(10.0, impact))
     likelihood = max(0.0, min(10.0, likelihood))
     exposure = max(0.0, min(10.0, exposure))
-    # 0..100 scale
-    return round((impact * likelihood * exposure), 1)
+    raw = impact * likelihood * exposure
+    # Normalize to a 0–100 scale
+    return round((raw / 10.0), 1)
 
 # ------------------------- data models -------------------------
 @dataclass
