@@ -73,6 +73,17 @@ Findings include:
 
 Permission errors are shown as `permission-error` findings with the failed operation and AWS error message.
 
+## Example Output
+
++----------+-------------+--------------------+----------------------+-------------+------------------+---------+----------+--------------------------------------------------+
+| severity | risk_type   | principal          | policy               | attachment  | exposure         | actions | privesc  | detail                                           |
++----------+-------------+--------------------+----------------------+-------------+------------------+---------+----------+--------------------------------------------------+
+| 91.0     | wildcard    | Role:AdminRole     | AdminAccess          | managed     | public           | 999     |          | Effect:Allow with Action:* and Resource:*       |
+| 75.0     | many-actions| User:JohnDoe       | CustomPowerUser      | managed     | external-account | 240     |          | Effect:Allow with many distinct actions         |
+| 28.5     | wildcard    | Role:DevOpsRole    | DevOpsWildcardPolicy | managed     | internal         | 999     |          | Effect:Allow with Action:* and Resource:*       |
+| 0.0      | insufficient-permissions | -:-               | SecretPolicy         | managed     | internal         | 0       |          | iam:GetPolicy failed: AccessDenied: Not allowed |
++----------+-------------+--------------------+----------------------+-------------+------------------+---------+----------+--------------------------------------------------+
+
 ## Requirements
 
 * Python 3.7+
