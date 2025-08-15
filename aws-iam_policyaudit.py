@@ -1,25 +1,20 @@
 #!/usr/bin/env python3
 """
-AWS IAM Permissiveness Audit — refactor of aws-iam-allactions.py (fully patched)
+AWS IAM Permissiveness Audit — refactor of aws-iam-allactions.py (sensitive-aware)
 
-Highlights
-----------
-- Wildcard & many-actions detection on policy documents
-- Attachment awareness (users/roles/groups using a managed policy)
-- Sensitive action simulation per principal (optional)
-- Privilege-escalation pattern detection (optional)
-- Cross-account/public role trust exposure classification (optional)
-- Tracks and prints **insufficient-permissions** findings for denied API calls
-- Robust handling where `list_entities_for_policy` does NOT return ARNs
-- On-demand ARN resolution for principals (User/Role/Group)
-- Severity scoring and multi-format output (table, JSON, CSV)
+What’s new in this splice
+-------------------------
+- Loads a curated **sensitive actions set** from JSON (or uses a solid default).
+- Treats findings as **sensitive** if they include "*" / "service:*" OR intersect the sensitive set.
+- **Severity bump**: internal findings that are wildcard or sensitive are raised to at least **High-ish**.
+- Keeps normalized 0–100 scores and your original structure.
+- Retains: wildcard/many-actions checks, attachment awareness, simulation, privesc, cross-account exposure,
+  insufficient-permissions findings, ARN resolution, and multi-format output.
 
-Usage (examples)
-----------------
+Example
+-------
 python aws-iam-permissiveness-audit.py --simulate --check-privesc --check-cross-account \
-  --format json --output findings.json --profile myprof --region us-east-1
-
-python aws-iam-permissiveness-audit.py --threshold 30 --include-aws-managed --format table
+  --sensitive-actions-file sensitive_actions.json --format table
 """
 
 import argparse
@@ -39,26 +34,28 @@ except Exception as e:  # pragma: no cover
     print("boto3 is required: pip install boto3", file=sys.stderr)
     raise
 
-# ------------------------- config & constants -------------------------
+# ------------------------- config & defaults -------------------------
 DEFAULT_THRESHOLD = 20
 DEFAULT_SENSITIVE_SERVICES = [
     "iam", "sts", "s3", "kms", "ec2", "lambda", "ecr", "secretsmanager", "ssm", "organizations",
 ]
-# A small curated set of sensitive, high-impact actions for simulation. Add more as needed.
+# Small seed; you can override/extend via --sensitive-actions-file
 SENSITIVE_ACTIONS_SEED = sorted({
     # IAM and identity
     "iam:PassRole", "iam:CreateAccessKey", "iam:CreateLoginProfile", "iam:AttachUserPolicy",
     "iam:AttachRolePolicy", "iam:PutUserPolicy", "iam:PutRolePolicy", "iam:UpdateAssumeRolePolicy",
+    "iam:CreatePolicy", "iam:CreatePolicyVersion", "iam:SetDefaultPolicyVersion",
     # STS
     "sts:AssumeRole", "sts:AssumeRoleWithWebIdentity",
-    # Data plane (examples)
-    "s3:PutObject", "s3:GetObject", "s3:DeleteObject", "s3:PutBucketPolicy", "s3:GetBucketAcl",
-    # Compute / execution
-    "lambda:CreateFunction", "lambda:UpdateFunctionCode", "lambda:InvokeFunction",
-    "ec2:RunInstances", "ec2:CreateSecurityGroup", "ec2:AuthorizeSecurityGroupIngress",
-    "ecs:RunTask",
-    # Secrets / keys
-    "kms:Decrypt", "kms:Encrypt", "kms:CreateGrant", "secretsmanager:GetSecretValue",
+    # Data plane / control plane examples
+    "s3:PutBucketPolicy", "s3:PutBucketAcl", "s3:PutBucketPublicAccessBlock", "s3:PutObject", "s3:DeleteObject",
+    "lambda:CreateFunction", "lambda:UpdateFunctionCode", "lambda:UpdateFunctionConfiguration",
+    "ec2:RunInstances", "ec2:AssociateIamInstanceProfile", "ec2:ReplaceIamInstanceProfileAssociation",
+    "ecr:PutImage", "ecr:BatchDeleteImage",
+    "kms:CreateGrant", "kms:ScheduleKeyDeletion", "kms:DisableKey", "kms:EnableKey",
+    "secretsmanager:PutSecretValue", "secretsmanager:UpdateSecret", "secretsmanager:DeleteSecret",
+    "ssm:SendCommand", "ssm:PutParameter", "ssm:DeleteParameter",
+    "organizations:AttachPolicy", "organizations:UpdatePolicy",
 })
 
 PRIVESC_RULES = [
@@ -97,7 +94,6 @@ def normalize_statement(stmt: Dict[str, Any]) -> Tuple[List[str], List[str], Lis
 def is_unrestricted(actions: List[str], resources: List[str], effect: str, cond: Dict[str, Any]) -> bool:
     if effect != "Allow":
         return False
-    # Action wildcard (service:* or *) AND fully unscoped resources AND no conditions
     action_wild = any(a == "*" or a.endswith(":*") for a in actions)
     resource_wild = any(r == "*" or ":*" in r for r in resources)
     return action_wild and resource_wild and not cond
@@ -108,12 +104,13 @@ def count_unique_actions(actions: List[str]) -> int:
 
 
 def score_finding(impact: float, likelihood: float, exposure: float) -> float:
+    # Clamp to 0..10
     impact = max(0.0, min(10.0, impact))
     likelihood = max(0.0, min(10.0, likelihood))
     exposure = max(0.0, min(10.0, exposure))
     raw = impact * likelihood * exposure
-    # Normalize to a 0–100 scale
-    return round((raw / 10.0), 1)
+    # Normalize to 0–100
+    return round(raw / 10.0, 1)
 
 # ------------------------- data models -------------------------
 @dataclass
@@ -141,6 +138,31 @@ class Finding:
     allowed_examples: Optional[List[str]] = None
     privesc_hits: Optional[List[str]] = None
     severity_score: Optional[float] = None
+
+# ------------------------- sensitive actions loading -------------------------
+def load_sensitive_actions(path: Optional[str]) -> set[str]:
+    """
+    Load a JSON array of actions (e.g., ["iam:PassRole","s3:PutBucketPolicy"]) as the sensitive set.
+    Falls back to SENSITIVE_ACTIONS_SEED if file missing/invalid.
+    """
+    default = {a.lower() for a in SENSITIVE_ACTIONS_SEED}
+    if not path:
+        return default
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        items = {str(x).lower() for x in data if isinstance(x, str)}
+        return items if items else default
+    except Exception:
+        return default
+
+
+def has_sensitive(actions: List[str], sensitive_actions_set: set[str]) -> bool:
+    """True if wildcard/service:* or any action intersects the sensitive set."""
+    actions_l = [a.lower() for a in actions]
+    if any(a == "*" or a.endswith(":*") for a in actions_l):
+        return True
+    return any(a in sensitive_actions_set for a in actions_l)
 
 # ------------------------- boto session helpers -------------------------
 def make_session(profile: Optional[str], region: Optional[str]):
@@ -185,15 +207,12 @@ def resolve_principal_arn(iam, principal: Attachment, account_id: str, partition
             return user.get("Arn")
         if principal.type == "Group":
             grp = iam.get_group(GroupName=principal.name)["Group"]
-            # In most regions, GetGroup returns Arn in the "Group" dict
             arn = grp.get("Arn")
             if arn:
                 return arn
     except ClientError:
-        # Fall through to best-effort construction
         pass
-
-    # Construct a best-effort ARN (works for roles/users/groups typical formats)
+    # Construct a best-effort ARN (typical formats)
     if principal.type == "Role":
         return f"arn:{partition}:iam::{account_id}:role/{principal.name}"
     if principal.type == "User":
@@ -238,8 +257,7 @@ def get_role_trust(iam, role_name: str) -> Dict[str, Any]:
 def simulate_principal_actions(iam, arn: str, actions: List[str], resources: Optional[List[str]] = None) -> List[str]:
     """Return list of actions from `actions` that evaluate as allowed for the given principal."""
     allowed: List[str] = []
-    # Split in chunks of 100 (API limit)
-    chunk = 100
+    chunk = 100  # API limit
     for i in range(0, len(actions), chunk):
         part = actions[i:i+chunk]
         resp = iam.simulate_principal_policy(
@@ -278,7 +296,6 @@ def audit_policy_document(policy_doc: Dict[str, Any], threshold: int) -> Dict[st
                 "explicit_denies": explicit_denies,
             })
             continue
-        # Skip NotAction blocks for many-actions heuristic; they need a different analysis.
         if actions and effect == "Allow":
             cnt = count_unique_actions(actions)
             if cnt >= threshold:
@@ -312,20 +329,41 @@ def analyze_cross_account_exposure(trust_doc: Dict[str, Any], self_acct: str) ->
                 acct_ids.add(p.split("::")[1].split(":")[0])
             except Exception:
                 pass
-    # If any account differs from self, call it external-account
     if any(a != self_acct for a in acct_ids):
         return "external-account"
     return "internal"
 
 
-def severity_from_factors(is_wildcard: bool, action_count: int, exposure: str, has_conditions: bool) -> float:
+def severity_from_factors(
+    is_wildcard: bool,
+    action_count: int,
+    exposure: str,
+    has_conditions: bool,
+    sensitive: bool = False,
+    privesc_hits: Optional[List[str]] = None,
+) -> float:
+    """
+    Compose severity with opinionated bumps:
+    - Keep normalized 0–100.
+    - Internal + (sensitive or wildcard) should not sink to medium; raise floor.
+    - Privilege escalation adds a kicker.
+    """
     impact = 9.5 if is_wildcard else min(9.0, 4 + action_count / 10)
     exposure_map = {"public": 10, "external-account": 8, "internal": 5}
     exposure_score = exposure_map.get(exposure, 5)
-    likelihood = 6.0
-    if has_conditions:
-        likelihood -= 2.0
-    return score_finding(impact, likelihood, exposure_score)
+    likelihood = 6.5 - (2.0 if has_conditions else 0.0)
+
+    base = score_finding(impact, likelihood, exposure_score)
+
+    # Internal but clearly dangerous? Lift it.
+    if exposure == "internal" and (sensitive or is_wildcard):
+        base = max(base, 45.0)  # floor into high-ish territory
+        base += 5.0             # small nudge
+
+    if privesc_hits:
+        base += 10.0
+
+    return round(min(base, 100.0), 1)
 
 def make_insufficient_perm_finding(account_id: str, policy_arn: str, policy_name: str, operation: str, err: Exception) -> Finding:
     code = None
@@ -349,7 +387,7 @@ def make_insufficient_perm_finding(account_id: str, policy_arn: str, policy_name
 def run_audit(
     profile: Optional[str], region: Optional[str], assume_role_arn: Optional[str], threshold: int,
     include_aws_managed: bool, simulate: bool, check_privesc_flag: bool, check_cross_acct: bool,
-    services: List[str], max_workers: int
+    services: List[str], max_workers: int, sensitive_actions_set: set[str]
 ) -> List[Finding]:
     base_session = make_session(profile, region)
     session = assume_role_if_needed(base_session, assume_role_arn)
@@ -363,12 +401,11 @@ def run_audit(
     caller_arn = ident.get("Arn")
     partition = get_partition_from_sts_arn(caller_arn)
 
-    sensitive_actions = [a for a in SENSITIVE_ACTIONS_SEED if a.split(":")[0] in services or a == "*"]
+    sensitive_actions_for_sim = [a for a in SENSITIVE_ACTIONS_SEED if a.split(":")[0] in services or a == "*"]
 
     findings: List[Finding] = []
-    errors: List[str] = []  # kept for debugging; not shown unless converted to findings
+    errors: List[str] = []
 
-    # Enumerate policies and analyze
     policy_iter = list_policies(iam, include_aws_managed)
 
     def process_policy(p: Dict[str, Any]) -> List[Finding]:
@@ -403,11 +440,12 @@ def run_audit(
 
         # Helper to build a finding; resolve ARN if missing
         def mk_find(principal: Optional[Attachment], risk_type: str, detail: str, action_count: Optional[int],
-                    conditions: Optional[Dict[str, Any]], exposure: str, explicit_denies: int) -> Finding:
+                    conditions: Optional[Dict[str, Any]], exposure: str, explicit_denies: int,
+                    sensitive_flag: bool = False, privesc_hits: Optional[List[str]] = None) -> Finding:
             principal_arn = None
             if principal:
                 principal_arn = principal.arn or resolve_principal_arn(iam, principal, account_id, partition)
-            return Finding(
+            f = Finding(
                 account_id=account_id,
                 policy_arn=policy_arn,
                 policy_name=policy_name,
@@ -421,7 +459,18 @@ def run_audit(
                 conditions=conditions,
                 explicit_denies=explicit_denies,
                 exposure=exposure,
+                privesc_hits=privesc_hits,
             )
+            has_conditions = bool(f.conditions)
+            f.severity_score = severity_from_factors(
+                is_wildcard=(risk_type == "wildcard"),
+                action_count=(f.action_count or 0),
+                exposure=f.exposure,
+                has_conditions=has_conditions,
+                sensitive=sensitive_flag,
+                privesc_hits=privesc_hits,
+            )
+            return f
 
         # Wildcards
         for hit in quick["wildcard"]:
@@ -437,6 +486,7 @@ def run_audit(
                     except ClientError as e:
                         errors.append(f"iam:GetRole failed for {policy_arn}: {e}")
                         res.append(make_insufficient_perm_finding(account_id, policy_arn, policy_name, "iam:GetRole", e))
+                # wildcard is inherently sensitive
                 f = mk_find(
                     principal,
                     "wildcard",
@@ -445,9 +495,8 @@ def run_audit(
                     hit.get("conditions"),
                     exposure,
                     hit.get("explicit_denies", 0),
+                    sensitive_flag=True,
                 )
-                has_conditions = bool(f.conditions)
-                f.severity_score = severity_from_factors(True, 999, f.exposure, has_conditions)
                 res.append(f)
 
         # Many-actions
@@ -455,6 +504,11 @@ def run_audit(
             principals = attached["User"] + attached["Role"] + attached["Group"]
             if not principals:
                 principals = [None]
+            # Pull the statement to assess sensitivity
+            stmt = hit.get("statement", {})
+            actions, _, resources, _, _ = normalize_statement(stmt)
+            sens_flag = has_sensitive(actions, sensitive_actions_set)
+
             for principal in principals:
                 exposure = "internal"
                 if check_cross_acct and principal and principal.type == "Role":
@@ -472,19 +526,18 @@ def run_audit(
                     hit.get("conditions"),
                     exposure,
                     hit.get("explicit_denies", 0),
+                    sensitive_flag=sens_flag,
                 )
-                has_conditions = bool(f.conditions)
-                f.severity_score = severity_from_factors(False, f.action_count or 0, f.exposure, has_conditions)
                 res.append(f)
 
         # Optional simulation & privesc per principal
         if simulate or check_privesc_flag:
             principals = attached["User"] + attached["Role"] + attached["Group"]
             for principal in principals:
-                # Ensure we have an ARN for SimulatePrincipalPolicy
-                arn = (principal.arn if principal else None) or (resolve_principal_arn(iam, principal, account_id, partition) if principal else None)
-                if principal and not arn:
-                    # Couldn’t resolve; record and continue
+                if not principal:
+                    continue
+                arn = principal.arn or resolve_principal_arn(iam, principal, account_id, partition)
+                if not arn:
                     res.append(Finding(
                         account_id=account_id,
                         policy_arn=policy_arn,
@@ -498,40 +551,35 @@ def run_audit(
                         severity_score=0.0,
                     ))
                     continue
-
-                if not principal:
-                    # No principal (unattached policy) → nothing to simulate
-                    continue
-
                 try:
-                    allowed = simulate_principal_actions(iam, arn, sensitive_actions)  # type: ignore[arg-type]
+                    allowed = simulate_principal_actions(iam, arn, sensitive_actions_for_sim)
                 except ClientError as e:
                     errors.append(f"SimulatePrincipalPolicy failed for {arn}: {e}")
                     res.append(make_insufficient_perm_finding(account_id, policy_arn, policy_name, "iam:SimulatePrincipalPolicy", e))
                     allowed = []
                 if allowed:
+                    pr_hits = check_privesc(allowed) if check_privesc_flag else []
+                    sens = any(a.lower() in sensitive_actions_set or a.endswith(":*") for a in allowed)
+                    exposure = "internal"
+                    if check_cross_acct and principal.type == "Role":
+                        try:
+                            trust = get_role_trust(iam, principal.name)
+                            exposure = analyze_cross_account_exposure(trust, account_id)
+                        except ClientError as e:
+                            errors.append(f"iam:GetRole failed for {policy_arn}: {e}")
+                            res.append(make_insufficient_perm_finding(account_id, policy_arn, policy_name, "iam:GetRole", e))
                     f = mk_find(
                         principal,
                         "effective-access",
                         "Principal is allowed selected sensitive actions (simulation)",
                         len(allowed),
                         None,
-                        "internal",
+                        exposure,
                         0,
+                        sensitive_flag=sens,
+                        privesc_hits=pr_hits or None,
                     )
-                    if check_cross_acct and principal.type == "Role":
-                        try:
-                            trust = get_role_trust(iam, principal.name)
-                            f.exposure = analyze_cross_account_exposure(trust, account_id)
-                        except ClientError as e:
-                            errors.append(f"iam:GetRole failed for {policy_arn}: {e}")
-                            res.append(make_insufficient_perm_finding(account_id, policy_arn, policy_name, "iam:GetRole", e))
                     f.allowed_examples = sorted(allowed)[:25]
-                    f.severity_score = severity_from_factors(False, len(allowed), f.exposure, False)
-                    if check_privesc_flag:
-                        f.privesc_hits = check_privesc(allowed)
-                        if f.privesc_hits:
-                            f.severity_score = min(100.0, (f.severity_score or 0) + 10.0)
                     res.append(f)
 
         return res
@@ -544,7 +592,6 @@ def run_audit(
 
 # ------------------------- output -------------------------
 def to_table(findings: List[Finding]) -> str:
-    # Summaries by risk type (including insufficient-permissions)
     totals = defaultdict(int)
     for f in findings:
         totals[f.risk_type] += 1
@@ -567,7 +614,6 @@ def to_table(findings: List[Finding]) -> str:
             ",".join(f.privesc_hits or []) if f.privesc_hits else "",
             (f.detail[:80] + "…") if len(f.detail) > 80 else f.detail,
         ])
-    # Minimal fixed-width table to avoid extra deps
     colw = [max(len(str(c)) for c in [h] + [r[i] for r in rows]) for i, h in enumerate(headers)]
     line = "+" + "+".join("-" * (w + 2) for w in colw) + "+"
     out = []
@@ -588,7 +634,6 @@ def to_json(findings: List[Finding]) -> str:
 
 
 def to_csv(findings: List[Finding]) -> str:
-    # Return CSV as string
     headers = [
         "account_id","policy_arn","policy_name","attachment_type","principal_type","principal_name","principal_arn",
         "risk_type","detail","action_count","conditions","explicit_denies","exposure","allowed_examples","privesc_hits","severity_score"
@@ -639,12 +684,14 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--region", help="AWS region (for STS/clients)")
     p.add_argument("--assume-role-arn", help="Role ARN to assume before scanning")
     p.add_argument("--max-workers", type=int, default=8, help="Concurrency for policy processing")
+    p.add_argument("--sensitive-actions-file", help="Path to JSON file (array of actions) to treat as sensitive")
     return p.parse_args(argv)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
     services = [s.strip().lower() for s in args.services.split(",") if s.strip()]
+    sensitive_set = load_sensitive_actions(args.sensitive_actions_file)
 
     findings = run_audit(
         profile=args.profile,
@@ -657,6 +704,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         check_cross_acct=args.check_cross_account,
         services=services,
         max_workers=args.max_workers,
+        sensitive_actions_set=sensitive_set,
     )
 
     write_output(findings, args.format, args.output)
