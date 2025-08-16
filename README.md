@@ -23,7 +23,7 @@ pip install boto3
 ## Usage
 
 ```bash
-python aws-iam-permissiveness-audit.py [options]
+python aws-iam_policyaudit.py [options]
 ```
 
 ### Options
@@ -50,7 +50,7 @@ python aws-iam-permissiveness-audit.py [options]
 Scan all customer-managed policies in the default AWS CLI profile, simulate sensitive actions, check for privilege escalation, and output JSON:
 
 ```bash
-python aws-iam-permissiveness-audit.py --simulate --check-privesc --format json --output findings.json
+python aws-iam_policyaudit.py --simulate --check-privesc --format json --output findings.json
 ```
 
 ## Severity Score Legend
