@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-AWS IAM Permissiveness Audit — refactor of aws-iam-allactions.py (sensitive-aware)
+AWS IAM Permissiveness Audit — refactor of aws-iam-allactions.py, aws-iam-crossaccount.py, aws-iam-passrole.py etc
 
 """
 
