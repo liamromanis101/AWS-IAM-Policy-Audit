@@ -77,7 +77,7 @@ Permission errors are shown as `permission-error` findings with the failed opera
 
 ## Example Output
 
-### Example findings (GitHub Markdown)
+### Example findings 
 
 Findings summary: wildcard=2, many-actions=1, insufficient-permissions=1
 
